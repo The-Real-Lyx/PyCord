@@ -13,7 +13,7 @@ if %errorlevel% neq 0 (
 )
 
 echo ============================================
-echo   Python + Module Installer
+echo    Python + Module Installer
 echo ============================================
 echo.
 
@@ -87,12 +87,6 @@ for %%M in (%MODULES%) do (
 )
 
 echo.
-echo    Note: Standard libraries (uuid, socket, re,
-echo    platform, getpass, datetime, os, subprocess,
-echo    asyncio, urllib, concurrent.futures, threading,
-echo    shutil, zipfile, io, sys, ctypes, tempfile,
-echo    winreg, time) are already included with Python.
-echo.
 
 :: ============================================
 :: 4. Verification
@@ -107,28 +101,32 @@ python -c "import PyInstaller; print('  [OK] PyInstaller', PyInstaller.__version
 
 echo.
 echo ============================================
-echo   Installation complete!
+echo    Installation complete!
 echo ============================================
 echo.
 
 :: ============================================
-:: Start builder.cmd
+:: Launch builder.pyw and close this CMD window
 :: ============================================
-set "BUILDER=%~dp0builder.cmd"
+:: Since builder.pyw uses the .pyw extension, Windows
+:: automatically associates it with pythonw.exe,
+:: so the GUI starts WITHOUT a console window.
 
-if exist "%BUILDER%" (
-    echo Starting builder.cmd ...
-    echo.
-    timeout /t 2 /nobreak >nul
-    call "%BUILDER%"
-) else (
-    echo ERROR: builder.cmd was not found!
-    echo Expected at: %BUILDER%
-    echo.
-    echo Please make sure builder.cmd is in the same
-    echo folder as this install.bat.
-    echo.
-    pause
+set "BUILDER=%~dp0builder.pyw"
+
+if not exist "%BUILDER%" (
+    :: File missing -> show invisible error via VBS
+    set "VBS=%TEMP%\pycord_err.vbs"
+    > "!VBS!" echo MsgBox "builder.pyw was not found." ^& vbCrLf ^& "Expected at: %BUILDER%", 16, "PyCord Installer"
+    wscript //nologo "!VBS!"
+    del "!VBS!" >nul 2>&1
+    endlocal
+    exit /b 1
 )
 
+:: Launch GUI (start "" = do not wait, .pyw = no console)
+start "" "%BUILDER%"
+
+:: Close CMD window immediately
 endlocal
+exit /b 0
